@@ -548,30 +548,278 @@ def _java_method_receiver_types(
     return table
 
 
-def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
-    """Collect annotation names from a Java declaration's `modifiers` child."""
-    names: list[str] = []
+_ANNOTATION_NAME_NODES = ("identifier", "scoped_identifier", "type_identifier")
+
+
+def _annotation_value_text(node, source: bytes) -> tuple[object, str]:
+    """Reduce an annotation-argument expression to a (value, kind) pair.
+
+    `kind` tells a consumer whether the value is usable as-is (`string`,
+    `number`, `boolean`) or is still a symbolic reference it has to resolve
+    itself (`reference`, e.g. `TableNames.ORDERS`). Anything else keeps its
+    raw source text under `expression` so no information is silently lost.
+    """
+    t = node.type
+    if t in ("string_literal", "line_string_literal", "multi_line_string_literal"):
+        parts = [
+            _read_text(c, source)
+            for c in node.children
+            if c.type in ("string_fragment", "string_content")
+        ]
+        return ("".join(parts), "string")
+    if t in ("decimal_integer_literal", "integer_literal", "hex_integer_literal",
+             "decimal_floating_point_literal", "real_literal"):
+        return (_read_text(node, source), "number")
+    if t in ("true", "false", "boolean_literal"):
+        return (_read_text(node, source), "boolean")
+    if t in ("field_access", "navigation_expression", "scoped_identifier",
+             "identifier", "simple_identifier"):
+        return (_read_text(node, source), "reference")
+    if t in ("array_initializer", "collection_literal"):
+        items = [
+            _annotation_value_text(c, source)
+            for c in node.children
+            if c.is_named
+        ]
+        return ([value for value, _kind in items], "array")
+    return (_read_text(node, source), "expression")
+
+
+def _annotation_args(args_node, source: bytes) -> list[dict]:
+    """Flatten an annotation's argument list into `{name, value, kind}` dicts.
+
+    A single positional argument is keyed `value`, matching the Spring/Java
+    convention that `@GetMapping("/x")` is shorthand for `value = "/x"`, so a
+    consumer reads the route path the same way regardless of which form the
+    source used. Named arguments keep their own name.
+    """
+    if args_node is None:
+        return []
+    args: list[dict] = []
+    for child in args_node.children:
+        if not child.is_named:
+            continue
+        if child.type in ("element_value_pair", "value_argument"):
+            name_node = None
+            value_node = None
+            for sub in child.children:
+                if not sub.is_named:
+                    continue
+                if name_node is None and value_node is None and sub.type in (
+                    "identifier", "simple_identifier",
+                ) and any(c.type == "=" for c in child.children):
+                    name_node = sub
+                    continue
+                value_node = sub
+            if value_node is None:
+                continue
+            value, kind = _annotation_value_text(value_node, source)
+            args.append({
+                "name": _read_text(name_node, source) if name_node is not None else "value",
+                "value": value,
+                "kind": kind,
+            })
+            continue
+        value, kind = _annotation_value_text(child, source)
+        args.append({"name": "value", "value": value, "kind": kind})
+    return args
+
+
+def _java_annotations(declaration_node, source: bytes) -> list[dict]:
+    """Collect `{name, args}` for annotations on a Java declaration.
+
+    Arguments are captured, not just names: `@GetMapping("/orders/{id}")`
+    carries the route path that makes the declaration an HTTP endpoint, and
+    dropping it makes the annotation indistinguishable from a bare marker.
+    """
+    annotations: list[dict] = []
     modifiers = None
     for child in declaration_node.children:
         if child.type == "modifiers":
             modifiers = child
             break
     if modifiers is None:
-        return names
+        return annotations
     for anno in modifiers.children:
         if anno.type not in ("marker_annotation", "annotation"):
             continue
         name_node = anno.child_by_field_name("name")
         if name_node is None:
             for sub in anno.children:
-                if sub.type in ("identifier", "scoped_identifier", "type_identifier"):
+                if sub.type in _ANNOTATION_NAME_NODES:
                     name_node = sub
                     break
-        if name_node is not None:
-            text = _read_text(name_node, source).rsplit(".", 1)[-1]
-            if text:
-                names.append(text)
-    return names
+        if name_node is None:
+            continue
+        name = _read_text(name_node, source).rsplit(".", 1)[-1]
+        if not name:
+            continue
+        args_node = anno.child_by_field_name("arguments")
+        if args_node is None:
+            args_node = next(
+                (c for c in anno.children if c.type == "annotation_argument_list"), None
+            )
+        annotations.append({"name": name, "args": _annotation_args(args_node, source)})
+    return annotations
+
+
+def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
+    """Collect annotation names from a Java declaration's `modifiers` child."""
+    return [anno["name"] for anno in _java_annotations(declaration_node, source)]
+
+
+_KOTLIN_ANNOTATION_CHAIN_TYPES = frozenset({"annotation", "annotated_expression"})
+_KOTLIN_ANNOTATION_STOP_TYPES = frozenset({
+    "class_declaration", "object_declaration", "function_declaration",
+    "class_body", "function_body", "enum_class_body", "property_declaration",
+})
+
+
+def _kotlin_annotation_node(anno_node, source: bytes) -> dict | None:
+    """Reduce a Kotlin `annotation` node to `{name, args}`."""
+    invocation = next(
+        (c for c in anno_node.children if c.type == "constructor_invocation"), None
+    )
+    holder = invocation if invocation is not None else anno_node
+    user_type = next((c for c in holder.children if c.type == "user_type"), None)
+    name = None
+    if user_type is not None:
+        name = _kotlin_user_type_name(user_type, source)
+    else:
+        ident = next(
+            (c for c in holder.children if c.type in ("simple_identifier", "identifier")), None
+        )
+        if ident is not None:
+            name = _read_text(ident, source)
+    if not name:
+        return None
+    args_node = next(
+        (c for c in holder.children if c.type == "value_arguments"), None
+    )
+    if args_node is None and invocation is None:
+        # A stacked top-level annotation parses its argument list as a sibling
+        # `parenthesized_expression` instead of a `constructor_invocation`.
+        args_node = next(
+            (c for c in anno_node.children if c.type == "parenthesized_expression"), None
+        )
+    return {"name": name.rsplit(".", 1)[-1], "args": _annotation_args(args_node, source)}
+
+
+def _kotlin_annotations_in(container, source: bytes) -> list[dict]:
+    """Collect every `annotation` in `container`, skipping nested declarations."""
+    out: list[dict] = []
+    stack = [container]
+    while stack:
+        node = stack.pop(0)
+        if node.type == "annotation":
+            anno = _kotlin_annotation_node(node, source)
+            if anno is not None:
+                out.append(anno)
+            continue
+        children = [c for c in node.children if c.is_named]
+        stack = [c for c in children if c.type not in _KOTLIN_ANNOTATION_STOP_TYPES] + stack
+    return out
+
+
+def _kotlin_is_annotation_chain(node) -> bool:
+    """True when `node` is an `annotated_expression` holding only annotations.
+
+    tree-sitter-kotlin parses stacked annotations on a class that declares a
+    primary constructor as a *preceding sibling* chain rather than as the
+    class's own `modifiers` child, so the sibling has to be read to see them.
+    Requiring a pure chain keeps an unrelated annotated expression that merely
+    happens to precede the class from being misattributed to it.
+    """
+    if node is None or node.type != "annotated_expression":
+        return False
+    for child in node.children:
+        if not child.is_named:
+            continue
+        if child.type not in _KOTLIN_ANNOTATION_CHAIN_TYPES:
+            return False
+        if child.type == "annotated_expression" and not _kotlin_is_annotation_chain(child):
+            return False
+    return True
+
+
+def _kotlin_annotations(declaration_node, source: bytes) -> list[dict]:
+    """Collect `{name, args}` for annotations on a Kotlin declaration.
+
+    Kotlin has no annotation collector upstream, and it needs two lookups
+    rather than Java's one: the `modifiers` child, plus the preceding
+    `annotated_expression` sibling chain that a class with a primary
+    constructor produces (see `_kotlin_is_annotation_chain`). Spring services
+    are overwhelmingly constructor-injected, so reading only `modifiers`
+    returns nothing for most real controllers.
+    """
+    annotations: list[dict] = []
+    for child in declaration_node.children:
+        if child.type in ("modifiers", "parameter_modifiers"):
+            annotations.extend(_kotlin_annotations_in(child, source))
+            break
+    sibling = declaration_node.prev_named_sibling
+    if _kotlin_is_annotation_chain(sibling):
+        annotations = _kotlin_annotations_in(sibling, source) + annotations
+    return annotations
+
+
+def _kotlin_const_property(property_node, source: bytes) -> tuple[str, object] | None:
+    """Return `(name, value)` for a Kotlin `const val NAME = <literal>`.
+
+    Annotation arguments frequently reference a constant rather than inlining a
+    literal (`@Table(TableNames.REGISTRATION)`), and the reference alone is not
+    usable downstream — the graph has to carry the value the constant holds.
+    Only `const` properties with a literal initializer qualify, so the recorded
+    value is always the real compile-time one.
+    """
+    modifiers = next((c for c in property_node.children if c.type == "modifiers"), None)
+    if modifiers is None:
+        return None
+    if not any(
+        _read_text(m, source) == "const"
+        for m in modifiers.children
+        if m.type == "property_modifier"
+    ):
+        return None
+    decl = next(
+        (c for c in property_node.children if c.type == "variable_declaration"), None
+    )
+    if decl is None:
+        return None
+    name_node = next(
+        (c for c in decl.children if c.type in ("simple_identifier", "identifier")), None
+    )
+    if name_node is None:
+        return None
+    name = _read_text(name_node, source)
+    if not name:
+        return None
+    initializer = None
+    seen_equals = False
+    for child in property_node.children:
+        if child.type == "=":
+            seen_equals = True
+            continue
+        if seen_equals and child.is_named:
+            initializer = child
+            break
+    if initializer is None:
+        return None
+    value, kind = _annotation_value_text(initializer, source)
+    if kind not in ("string", "number", "boolean"):
+        return None
+    return (name, value)
+
+
+def _annotations_metadata(declaration_node, source: bytes, ts_module: str) -> dict | None:
+    """Return `{"annotations": [...]}` for the languages that collect them."""
+    if ts_module == "tree_sitter_java":
+        annotations = _java_annotations(declaration_node, source)
+    elif ts_module == "tree_sitter_kotlin":
+        annotations = _kotlin_annotations(declaration_node, source)
+    else:
+        return None
+    return {"annotations": annotations} if annotations else None
 
 def _php_name_text(node, source: bytes) -> str | None:
     """Return the unqualified name text from a PHP `name`/`qualified_name` node."""
@@ -2339,6 +2587,12 @@ def _extract_generic(
             })
         return nid
 
+    def _emit_attribute_edges(owner_nid: str, annotations: list[dict], line: int) -> None:
+        for anno in annotations:
+            target_nid = ensure_named_node(anno["name"], line)
+            if target_nid != owner_nid:
+                add_edge(owner_nid, target_nid, "references", line, context="attribute")
+
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
@@ -2397,7 +2651,12 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
+            anno_metadata = _annotations_metadata(node, source, config.ts_module)
+            if anno_metadata:
+                metadata = {**(metadata or {}), **anno_metadata}
             add_node(class_nid, class_name, line, metadata=metadata)
+            if config.ts_module == "tree_sitter_kotlin" and anno_metadata:
+                _emit_attribute_edges(class_nid, anno_metadata["annotations"], line)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             callable_class_nids.add(class_nid)  # ...but only via its constructor (#2137)
             # A nested class/object/trait is contained by its ENCLOSING type, not
@@ -3047,9 +3306,16 @@ def _extract_generic(
         if (config.ts_module == "tree_sitter_kotlin"
                 and t == "property_declaration"
                 and parent_class_nid):
+            line = node.start_point[0] + 1
+            const = _kotlin_const_property(node, source)
+            if const is not None:
+                const_name, const_value = const
+                const_nid = _make_id(parent_class_nid, const_name)
+                add_node(const_nid, const_name, line,
+                         metadata={"const_value": const_value})
+                add_edge(parent_class_nid, const_nid, "contains", line)
             type_node = _kotlin_property_type_node(node)
             if type_node is not None:
-                line = node.start_point[0] + 1
                 refs: list[tuple[str, str]] = []
                 _kotlin_collect_type_refs(type_node, source, False, refs)
                 for ref_name, role in refs:
@@ -3229,14 +3495,17 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
+            func_metadata = _annotations_metadata(node, source, config.ts_module)
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                add_node(func_nid, f".{func_name}()", line, metadata=func_metadata)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line)
+                add_node(func_nid, f"{func_name}()", line, metadata=func_metadata)
                 add_edge(file_nid, func_nid, "contains", line)
+            if config.ts_module == "tree_sitter_kotlin" and func_metadata:
+                _emit_attribute_edges(func_nid, func_metadata["annotations"], line)
             callable_def_nids.add(func_nid)  # function / method def is callable
             if config.ts_module == "tree_sitter_python":
                 local_bound_names[func_nid] = _python_local_bound_names(node, source)

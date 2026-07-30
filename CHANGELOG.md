@@ -2,6 +2,12 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased
+
+- Feature: annotation *arguments* are captured, not just annotation names. A declaration's collected annotations are attached to its node as `metadata.annotations` (`[{"name": ..., "args": [{"name", "value", "kind"}]}]`), so `@GetMapping("/orders/{id}")` keeps the route path that makes it an HTTP endpoint. A single positional argument is keyed `value` to match the Java/Spring shorthand, and a symbolic argument (`@Table(TableNames.ORDERS)`) is tagged `kind: "reference"` rather than being silently reduced to a name.
+- Feature: Kotlin gains an annotation collector — it had none, so a Kotlin Spring service yielded no annotation data at all. It reads both shapes the grammar produces: the declaration's `modifiers` child, and the preceding `annotated_expression` sibling chain that a class declaring a primary constructor gets instead (the shape almost every constructor-injected bean has). Kotlin also now emits the `references`/`context="attribute"` edges Java already did.
+- Feature: Kotlin `const val NAME = <literal>` properties are emitted as nodes carrying `metadata.const_value`, so a constant referenced from an annotation argument can be resolved to the value it holds.
+
 ## 0.9.30 (2026-07-29)
 
 - Fix: pin `mcp` below 2.0 so a fresh `graphifyy[mcp]` / `graphifyy[all]` install works again (#2277, #2279, #2291). The `mcp` 2.0.0 major dropped the `mcp.types.AnyUrl` re-export and the `Server` decorator-registration API that `graphify/serve.py` uses, so an unpinned resolve broke `graphify-mcp` on every new install with an `ImportError`. The `mcp` and `all` extras now require `mcp>=1,<2` (resolving to 1.29.0) and `starlette>=1.3.1,<2`. Adapting to the mcp 2.x API is tracked as a follow-up.
