@@ -138,7 +138,7 @@ from graphify.extractors.resolution import (  # noqa: E402,F401
 
 from graphify.symbol_resolution import resolve_bash_source_edges  # noqa: E402
 
-from graphify.extractors.engine import REFERENCE_CONTEXTS, _CSHARP_TYPE_PARAMETER_SCOPE_DECLARATIONS, _C_PRIMITIVE_TYPE_NODES, _JAVA_BUILTIN_TYPES, _JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS, _JS_FUNCTION_VALUE_TYPES, _JS_SCOPE_BOUNDARY, _PYTHON_ANNOTATION_NOISE, _PYTHON_TYPE_CONTAINERS, _RUBY_CLASS_FACTORIES, _c_collect_type_refs, _cpp_collect_type_refs, _cpp_declarator_name, _cpp_local_var_types, _csharp_attribute_names, _csharp_classify_base, _csharp_collect_type_refs, _csharp_extra_walk, _csharp_member_type_table, _csharp_namespace_id, _csharp_namespace_name, _csharp_pre_scan_interfaces, _csharp_type_parameters_in_scope, _dynamic_import_js, _extract_generic, _find_body, _find_require_call, _get_cpp_func_name, _java_annotation_names, _java_collect_type_refs, _java_extra_walk, _java_type_parameters_in_scope, _js_collect_pattern_idents, _js_dispatch_value_idents, _js_extra_walk, _js_local_bound_names, _js_member_assignment_target, _js_module_bound_names, _kotlin_collect_type_refs, _kotlin_function_return_type_node, _kotlin_property_type_node, _kotlin_user_type_name, _php_collect_type_refs, _php_method_return_type_node, _php_name_text, _python_collect_assignment_targets, _python_collect_param_refs, _python_collect_type_refs, _python_local_bound_names, _python_module_bound_names, _python_param_names, _read_csharp_type_name, _require_imports_js, _ruby_const_last_name, _ruby_extra_walk, _ruby_local_class_bindings, _ruby_new_class_name, _scala_collect_type_refs, _semantic_reference_edge, _source_location, _swift_classify_base, _swift_collect_type_refs, _swift_constructor_type, _swift_declaration_keyword, _swift_extra_walk, _swift_local_var_types, _swift_pre_scan, _swift_property_name, _swift_property_type_node, _swift_receiver_name, _swift_user_type_name, _ts_decorator_name, _ts_descendant_decorators, _ts_emit_decorator_edges, _ts_extra_walk, _ts_method_name, _ts_receiver_type_table  # noqa: E402,F401
+from graphify.extractors.engine import REFERENCE_CONTEXTS, _CSHARP_TYPE_PARAMETER_SCOPE_DECLARATIONS, _C_PRIMITIVE_TYPE_NODES, _JAVA_BUILTIN_TYPES, _JAVA_TYPE_PARAMETER_SCOPE_DECLARATIONS, _JS_FUNCTION_VALUE_TYPES, _JS_SCOPE_BOUNDARY, _PYTHON_ANNOTATION_NOISE, _PYTHON_TYPE_CONTAINERS, _RUBY_CLASS_FACTORIES, _c_collect_type_refs, _cpp_collect_type_refs, _cpp_declarator_name, _cpp_local_var_types, _csharp_attribute_names, _csharp_classify_base, _csharp_collect_type_refs, _csharp_extra_walk, _csharp_member_type_table, _csharp_namespace_id, _csharp_namespace_name, _csharp_pre_scan_interfaces, _csharp_type_parameters_in_scope, _dynamic_import_js, _extract_generic, _find_body, _find_require_call, _get_cpp_func_name, _java_annotation_names, _java_collect_type_refs, _java_extra_walk, _java_type_parameters_in_scope, _js_collect_pattern_idents, _js_dispatch_value_idents, _js_extra_walk, _js_local_bound_names, _js_member_assignment_target, _js_module_bound_names, _kotlin_collect_type_refs, _kotlin_function_return_type_node, _kotlin_property_type_node, _kotlin_receiver_type_table, _kotlin_user_type_name, _php_collect_type_refs, _php_method_return_type_node, _php_name_text, _python_collect_assignment_targets, _python_collect_param_refs, _python_collect_type_refs, _python_local_bound_names, _python_module_bound_names, _python_param_names, _read_csharp_type_name, _require_imports_js, _ruby_const_last_name, _ruby_extra_walk, _ruby_local_class_bindings, _ruby_new_class_name, _scala_collect_type_refs, _semantic_reference_edge, _source_location, _swift_classify_base, _swift_collect_type_refs, _swift_constructor_type, _swift_declaration_keyword, _swift_extra_walk, _swift_local_var_types, _swift_pre_scan, _swift_property_name, _swift_property_type_node, _swift_receiver_name, _swift_user_type_name, _ts_decorator_name, _ts_descendant_decorators, _ts_emit_decorator_edges, _ts_extra_walk, _ts_method_name, _ts_receiver_type_table  # noqa: E402,F401
 
 from graphify.extractors.pascal import _PAS_BEGIN_END_TOKEN_RE, _PAS_CALL_RE, _PAS_END_SEMI_RE, _PAS_IMPL_HEADER_RE, _PAS_KEYWORDS, _PAS_METHOD_DECL_RE, _PAS_MODULE_RE, _PAS_TOKEN_RE, _PAS_TYPE_HEADER_RE, _PAS_USES_RE, _extract_pascal_regex, _pascal_find_body, _pascal_split_bases, _pascal_split_sections, _pascal_split_uses, _pascal_strip_comments, extract_pascal  # noqa: E402,F401
 
@@ -2860,6 +2860,102 @@ def _resolve_java_member_calls(
             })
 
 
+def _resolve_kotlin_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Kotlin member calls against the receiver's declared type.
+
+    Kotlin service code is almost entirely member calls (`repo.save(dto)`), and the
+    receiver is nearly always a primary-constructor property — the Spring
+    constructor-injection pattern — so typing the receiver is what makes the
+    language resolvable at all. Written as its own pass rather than folded into
+    `_resolve_java_member_calls` so the Java behaviour is untouched.
+
+    `this` resolves to the caller's own enclosing type and an explicitly named
+    (capitalized) receiver to the type it names — both exact. A receiver typed
+    through the file's property/parameter table is inferred. A missing or ambiguous
+    receiver type is skipped rather than falling back to a bare method-name match.
+    """
+    def key(label: str) -> str:
+        return str(label).strip().removeprefix(".").removesuffix("()")
+
+    contained = {edge.get("target") for edge in all_edges
+                 if edge.get("relation") == "contains"}
+    node_by_id = {node.get("id"): node for node in all_nodes}
+
+    type_def_nids: dict[str, list[str]] = {}
+    for node in all_nodes:
+        if (
+            node.get("source_file")
+            and node.get("id") in contained
+            and _is_type_like_definition(node)
+        ):
+            type_def_nids.setdefault(key(node.get("label", "")), []).append(node["id"])
+
+    method_index: dict[tuple[str, str], set[str]] = {}
+    enclosing_type: dict[str, str] = {}
+    for edge in all_edges:
+        if edge.get("relation") != "method":
+            continue
+        owner, method = edge.get("source"), edge.get("target")
+        method_node = node_by_id.get(method)
+        if method_node is None:
+            continue
+        enclosing_type.setdefault(method, owner)
+        method_index.setdefault((owner, key(method_node.get("label", ""))), set()).add(method)
+
+    existing_pairs = {(edge.get("source"), edge.get("target")) for edge in all_edges}
+    for result in per_file:
+        for raw_call in result.get("raw_calls", []):
+            if raw_call.get("lang") != "kotlin" or not raw_call.get("is_member_call"):
+                continue
+            receiver = raw_call.get("receiver")
+            callee = raw_call.get("callee")
+            caller = raw_call.get("caller_nid")
+            if not receiver or not callee or not caller:
+                continue
+
+            exact = False
+            if receiver == "this":
+                type_nid = enclosing_type.get(caller)
+                exact = True
+                if not type_nid:
+                    continue
+            else:
+                type_name = raw_call.get("receiver_type")
+                if not type_name and receiver[:1].isupper():
+                    # `Foo.bar()` / `Companion.of()`: the receiver names its own type.
+                    type_name = receiver
+                    exact = True
+                if not type_name:
+                    continue
+                type_defs = type_def_nids.get(key(type_name), [])
+                if len(type_defs) != 1:
+                    continue
+                type_nid = type_defs[0]
+
+            method_nids = method_index.get((type_nid, key(callee)), set())
+            if len(method_nids) != 1:
+                continue
+            method_nid = next(iter(method_nids))
+            if method_nid == caller or (caller, method_nid) in existing_pairs:
+                continue
+            existing_pairs.add((caller, method_nid))
+            all_edges.append({
+                "source": caller,
+                "target": method_nid,
+                "relation": "calls",
+                "context": "call",
+                "confidence": "EXTRACTED" if exact else "INFERRED",
+                "confidence_score": 1.0 if exact else 0.8,
+                "source_file": raw_call.get("source_file", ""),
+                "source_location": raw_call.get("source_location"),
+                "weight": 1.0,
+            })
+
+
 def _resolve_objc_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -3012,6 +3108,16 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("java_member_calls", frozenset({".java"}), _resolve_java_member_calls)
+)
+# Kotlin receiver-typed member-call resolution: `repo.save(dto)` bound to the
+# declared type of `repo` (usually a primary-constructor property — the Spring
+# constructor-injection pattern) instead of any same-named method in the corpus.
+register_language_resolver(
+    LanguageResolver(
+        "kotlin_member_calls",
+        frozenset({".kt", ".kts"}),
+        _resolve_kotlin_member_calls,
+    )
 )
 # Pascal/Delphi cross-file inherited-method-call resolution: a call from a
 # manual descendant class to a method it inherits from an ancestor declared

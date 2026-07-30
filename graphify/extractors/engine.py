@@ -1497,6 +1497,91 @@ def _csharp_member_type_table(root, source: bytes) -> dict[str, str]:
         table.pop(name, None)
     return table
 
+def _kotlin_binding_name(node, source: bytes) -> str | None:
+    """Return the bound name of a Kotlin declaration node.
+
+    ``variable_declaration`` / ``class_parameter`` / ``parameter`` all put the name
+    in their FIRST identifier child, ahead of the ``:`` and the type, so the type's
+    own identifiers can never be mistaken for the name.
+    """
+    for c in node.children:
+        if c.type in ("simple_identifier", "identifier"):
+            return _read_text(c, source) or None
+        if c.type in ("user_type", "nullable_type", "type_reference"):
+            break
+    return None
+
+def _kotlin_constructor_type(call_node, source: bytes) -> str | None:
+    """Return the constructed type of a Kotlin ``Foo(...)`` call expression.
+
+    Kotlin has no ``new``, so a constructor call is indistinguishable from a
+    function call at the syntax level; the capitalized-head convention is the only
+    available signal (the same inference Swift uses for ``let x = VM()``).
+    """
+    head = call_node.children[0] if call_node.children else None
+    if head is None or head.type not in ("simple_identifier", "identifier"):
+        return None
+    name = _read_text(head, source)
+    if not name or not name[:1].isupper():
+        return None
+    if name in _KOTLIN_BUILTIN_TYPES or name in _JAVA_BUILTIN_TYPES:
+        return None
+    return name
+
+def _kotlin_receiver_type_table(root, source: bytes) -> dict[str, str]:
+    """Collect ``name -> TypeName`` for Kotlin receiver typing: primary-constructor
+    properties (the Spring constructor-injection pattern), class and local
+    properties, and function parameters. An untyped ``val x = Foo()`` is typed from
+    its constructor, as Swift does for ``let x = VM()``.
+
+    File-scoped with the same conflict POISONING as ``_csharp_member_type_table``: a
+    name bound to two different types anywhere in the file — or bound once to a
+    resolvable type and redeclared with an unresolvable one — is dropped entirely, so
+    a local shadowing a field of a DIFFERENT type can never produce a wrong edge.
+    Only a concrete, non-builtin type name is recorded; the resolver drops an
+    untypable receiver rather than guessing.
+    """
+    table: dict[str, str] = {}
+    poisoned: set[str] = set()
+
+    def bind(name: str | None, type_name: str | None) -> None:
+        if not name:
+            return
+        if not type_name or table.get(name, type_name) != type_name:
+            poisoned.add(name)
+        else:
+            table[name] = type_name
+
+    def declared(type_node) -> str | None:
+        if type_node is None:
+            return None
+        refs: list[tuple[str, str]] = []
+        _kotlin_collect_type_refs(type_node, source, False, refs)
+        return next((name for name, role in refs if role == "type"), None)
+
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        t = n.type
+        if t == "property_declaration":
+            var = next(
+                (c for c in n.children if c.type == "variable_declaration"), None)
+            if var is not None:
+                type_name = declared(_kotlin_property_type_node(n))
+                if type_name is None:
+                    initializer = next(
+                        (c for c in n.children if c.type == "call_expression"), None)
+                    if initializer is not None:
+                        type_name = _kotlin_constructor_type(initializer, source)
+                bind(_kotlin_binding_name(var, source), type_name)
+        elif t in ("class_parameter", "parameter"):
+            bind(_kotlin_binding_name(n, source),
+                 declared(_kotlin_property_type_node(n)))
+        stack.extend(n.children)
+    for name in poisoned:
+        table.pop(name, None)
+    return table
+
 def _ts_receiver_type_table(root, source: bytes, table: dict[str, str]) -> None:
     """Add TS/JS receiver bindings to ``table`` (name -> TypeName), for member-call
     resolution beyond the constructor-injected `this.field` case (#1630):
@@ -3727,6 +3812,15 @@ def _extract_generic(
         )
         for body_id, (method_node, class_nid) in java_method_scopes.items()
     }
+    # Kotlin: file-wide `name -> TypeName` table so a member-call raw_call can carry
+    # its receiver's declared type for _resolve_kotlin_member_calls. File-scoped (not
+    # method-scoped) because class-level properties and primary-constructor
+    # properties are in scope for every method in the file.
+    kotlin_receiver_types = (
+        _kotlin_receiver_type_table(root, source)
+        if config.ts_module == "tree_sitter_kotlin"
+        else {}
+    )
 
     def _emit_indirect_by_name(ident_name: str, loc_node, scope_nid: str,
                                context: str) -> None:
@@ -3954,6 +4048,32 @@ def _extract_generic(
                             if child.type in ("simple_identifier", "identifier"):
                                 callee_name = _read_text(child, source)
                                 break
+                        # Capture the receiver so _resolve_kotlin_member_calls can
+                        # bind the call to the receiver's declared type instead of
+                        # the bare method name. Kotlin service code is almost
+                        # entirely member calls, so without this the whole language
+                        # resolves by name collision only.
+                        recv = first.children[0] if first.children else None
+                        if recv is not None:
+                            if recv.type in ("simple_identifier", "identifier"):
+                                member_receiver = _read_text(recv, source)
+                            elif recv.type in ("this_expression", "this"):
+                                member_receiver = "this"
+                            elif recv.type == "navigation_expression":
+                                # `this.field.m()`: type `field` exactly like a bare
+                                # `field.m()`. Any other chained receiver stays
+                                # untyped so the resolver bails rather than guessing.
+                                head = recv.children[0] if recv.children else None
+                                field = next(
+                                    (c for c in reversed(recv.children)
+                                     if c.type in ("simple_identifier", "identifier")),
+                                    None,
+                                )
+                                if (head is not None
+                                        and head.type in ("this_expression", "this")
+                                        and field is not None):
+                                    member_receiver = _read_text(field, source)
+                                    is_this_field_call = True
             elif config.ts_module == "tree_sitter_scala":
                 # Scala: first child
                 first = node.children[0] if node.children else None
@@ -4174,7 +4294,16 @@ def _extract_generic(
                 _java_defer = (
                     config.ts_module == "tree_sitter_java" and is_member_call
                 )
-                if _java_defer or (
+                # Kotlin: same rule as C# — a member call whose receiver was captured
+                # defers to the receiver-typed resolver. A bare method-name match
+                # ignores the receiver's type and mis-binds (`orderService.create()`
+                # landing on an unrelated in-file `create`). Chained receivers, where
+                # no receiver could be captured, keep the name match.
+                _kotlin_defer = (
+                    config.ts_module == "tree_sitter_kotlin"
+                    and is_member_call and member_receiver
+                )
+                if _java_defer or _kotlin_defer or (
                     is_member_call
                     and member_receiver
                     and (
@@ -4231,6 +4360,14 @@ def _extract_generic(
                     if config.ts_module == "tree_sitter_java":
                         rc_entry["lang"] = "java"
                         receiver_type = (java_types or {}).get(member_receiver or "")
+                        if receiver_type:
+                            rc_entry["receiver_type"] = receiver_type
+                    # Kotlin: tag the raw_call so _resolve_kotlin_member_calls claims
+                    # it, and carry the receiver's type from the file's
+                    # property/constructor-property/parameter table.
+                    if config.ts_module == "tree_sitter_kotlin":
+                        rc_entry["lang"] = "kotlin"
+                        receiver_type = kotlin_receiver_types.get(member_receiver or "")
                         if receiver_type:
                             rc_entry["receiver_type"] = receiver_type
                     raw_calls.append(rc_entry)
