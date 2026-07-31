@@ -548,30 +548,278 @@ def _java_method_receiver_types(
     return table
 
 
-def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
-    """Collect annotation names from a Java declaration's `modifiers` child."""
-    names: list[str] = []
+_ANNOTATION_NAME_NODES = ("identifier", "scoped_identifier", "type_identifier")
+
+
+def _annotation_value_text(node, source: bytes) -> tuple[object, str]:
+    """Reduce an annotation-argument expression to a (value, kind) pair.
+
+    `kind` tells a consumer whether the value is usable as-is (`string`,
+    `number`, `boolean`) or is still a symbolic reference it has to resolve
+    itself (`reference`, e.g. `TableNames.ORDERS`). Anything else keeps its
+    raw source text under `expression` so no information is silently lost.
+    """
+    t = node.type
+    if t in ("string_literal", "line_string_literal", "multi_line_string_literal"):
+        parts = [
+            _read_text(c, source)
+            for c in node.children
+            if c.type in ("string_fragment", "string_content")
+        ]
+        return ("".join(parts), "string")
+    if t in ("decimal_integer_literal", "integer_literal", "hex_integer_literal",
+             "decimal_floating_point_literal", "real_literal"):
+        return (_read_text(node, source), "number")
+    if t in ("true", "false", "boolean_literal"):
+        return (_read_text(node, source), "boolean")
+    if t in ("field_access", "navigation_expression", "scoped_identifier",
+             "identifier", "simple_identifier"):
+        return (_read_text(node, source), "reference")
+    if t in ("array_initializer", "collection_literal"):
+        items = [
+            _annotation_value_text(c, source)
+            for c in node.children
+            if c.is_named
+        ]
+        return ([value for value, _kind in items], "array")
+    return (_read_text(node, source), "expression")
+
+
+def _annotation_args(args_node, source: bytes) -> list[dict]:
+    """Flatten an annotation's argument list into `{name, value, kind}` dicts.
+
+    A single positional argument is keyed `value`, matching the Spring/Java
+    convention that `@GetMapping("/x")` is shorthand for `value = "/x"`, so a
+    consumer reads the route path the same way regardless of which form the
+    source used. Named arguments keep their own name.
+    """
+    if args_node is None:
+        return []
+    args: list[dict] = []
+    for child in args_node.children:
+        if not child.is_named:
+            continue
+        if child.type in ("element_value_pair", "value_argument"):
+            name_node = None
+            value_node = None
+            for sub in child.children:
+                if not sub.is_named:
+                    continue
+                if name_node is None and value_node is None and sub.type in (
+                    "identifier", "simple_identifier",
+                ) and any(c.type == "=" for c in child.children):
+                    name_node = sub
+                    continue
+                value_node = sub
+            if value_node is None:
+                continue
+            value, kind = _annotation_value_text(value_node, source)
+            args.append({
+                "name": _read_text(name_node, source) if name_node is not None else "value",
+                "value": value,
+                "kind": kind,
+            })
+            continue
+        value, kind = _annotation_value_text(child, source)
+        args.append({"name": "value", "value": value, "kind": kind})
+    return args
+
+
+def _java_annotations(declaration_node, source: bytes) -> list[dict]:
+    """Collect `{name, args}` for annotations on a Java declaration.
+
+    Arguments are captured, not just names: `@GetMapping("/orders/{id}")`
+    carries the route path that makes the declaration an HTTP endpoint, and
+    dropping it makes the annotation indistinguishable from a bare marker.
+    """
+    annotations: list[dict] = []
     modifiers = None
     for child in declaration_node.children:
         if child.type == "modifiers":
             modifiers = child
             break
     if modifiers is None:
-        return names
+        return annotations
     for anno in modifiers.children:
         if anno.type not in ("marker_annotation", "annotation"):
             continue
         name_node = anno.child_by_field_name("name")
         if name_node is None:
             for sub in anno.children:
-                if sub.type in ("identifier", "scoped_identifier", "type_identifier"):
+                if sub.type in _ANNOTATION_NAME_NODES:
                     name_node = sub
                     break
-        if name_node is not None:
-            text = _read_text(name_node, source).rsplit(".", 1)[-1]
-            if text:
-                names.append(text)
-    return names
+        if name_node is None:
+            continue
+        name = _read_text(name_node, source).rsplit(".", 1)[-1]
+        if not name:
+            continue
+        args_node = anno.child_by_field_name("arguments")
+        if args_node is None:
+            args_node = next(
+                (c for c in anno.children if c.type == "annotation_argument_list"), None
+            )
+        annotations.append({"name": name, "args": _annotation_args(args_node, source)})
+    return annotations
+
+
+def _java_annotation_names(declaration_node, source: bytes) -> list[str]:
+    """Collect annotation names from a Java declaration's `modifiers` child."""
+    return [anno["name"] for anno in _java_annotations(declaration_node, source)]
+
+
+_KOTLIN_ANNOTATION_CHAIN_TYPES = frozenset({"annotation", "annotated_expression"})
+_KOTLIN_ANNOTATION_STOP_TYPES = frozenset({
+    "class_declaration", "object_declaration", "function_declaration",
+    "class_body", "function_body", "enum_class_body", "property_declaration",
+})
+
+
+def _kotlin_annotation_node(anno_node, source: bytes) -> dict | None:
+    """Reduce a Kotlin `annotation` node to `{name, args}`."""
+    invocation = next(
+        (c for c in anno_node.children if c.type == "constructor_invocation"), None
+    )
+    holder = invocation if invocation is not None else anno_node
+    user_type = next((c for c in holder.children if c.type == "user_type"), None)
+    name = None
+    if user_type is not None:
+        name = _kotlin_user_type_name(user_type, source)
+    else:
+        ident = next(
+            (c for c in holder.children if c.type in ("simple_identifier", "identifier")), None
+        )
+        if ident is not None:
+            name = _read_text(ident, source)
+    if not name:
+        return None
+    args_node = next(
+        (c for c in holder.children if c.type == "value_arguments"), None
+    )
+    if args_node is None and invocation is None:
+        # A stacked top-level annotation parses its argument list as a sibling
+        # `parenthesized_expression` instead of a `constructor_invocation`.
+        args_node = next(
+            (c for c in anno_node.children if c.type == "parenthesized_expression"), None
+        )
+    return {"name": name.rsplit(".", 1)[-1], "args": _annotation_args(args_node, source)}
+
+
+def _kotlin_annotations_in(container, source: bytes) -> list[dict]:
+    """Collect every `annotation` in `container`, skipping nested declarations."""
+    out: list[dict] = []
+    stack = [container]
+    while stack:
+        node = stack.pop(0)
+        if node.type == "annotation":
+            anno = _kotlin_annotation_node(node, source)
+            if anno is not None:
+                out.append(anno)
+            continue
+        children = [c for c in node.children if c.is_named]
+        stack = [c for c in children if c.type not in _KOTLIN_ANNOTATION_STOP_TYPES] + stack
+    return out
+
+
+def _kotlin_is_annotation_chain(node) -> bool:
+    """True when `node` is an `annotated_expression` holding only annotations.
+
+    tree-sitter-kotlin parses stacked annotations on a class that declares a
+    primary constructor as a *preceding sibling* chain rather than as the
+    class's own `modifiers` child, so the sibling has to be read to see them.
+    Requiring a pure chain keeps an unrelated annotated expression that merely
+    happens to precede the class from being misattributed to it.
+    """
+    if node is None or node.type != "annotated_expression":
+        return False
+    for child in node.children:
+        if not child.is_named:
+            continue
+        if child.type not in _KOTLIN_ANNOTATION_CHAIN_TYPES:
+            return False
+        if child.type == "annotated_expression" and not _kotlin_is_annotation_chain(child):
+            return False
+    return True
+
+
+def _kotlin_annotations(declaration_node, source: bytes) -> list[dict]:
+    """Collect `{name, args}` for annotations on a Kotlin declaration.
+
+    Kotlin has no annotation collector upstream, and it needs two lookups
+    rather than Java's one: the `modifiers` child, plus the preceding
+    `annotated_expression` sibling chain that a class with a primary
+    constructor produces (see `_kotlin_is_annotation_chain`). Spring services
+    are overwhelmingly constructor-injected, so reading only `modifiers`
+    returns nothing for most real controllers.
+    """
+    annotations: list[dict] = []
+    for child in declaration_node.children:
+        if child.type in ("modifiers", "parameter_modifiers"):
+            annotations.extend(_kotlin_annotations_in(child, source))
+            break
+    sibling = declaration_node.prev_named_sibling
+    if _kotlin_is_annotation_chain(sibling):
+        annotations = _kotlin_annotations_in(sibling, source) + annotations
+    return annotations
+
+
+def _kotlin_const_property(property_node, source: bytes) -> tuple[str, object] | None:
+    """Return `(name, value)` for a Kotlin `const val NAME = <literal>`.
+
+    Annotation arguments frequently reference a constant rather than inlining a
+    literal (`@Table(TableNames.REGISTRATION)`), and the reference alone is not
+    usable downstream — the graph has to carry the value the constant holds.
+    Only `const` properties with a literal initializer qualify, so the recorded
+    value is always the real compile-time one.
+    """
+    modifiers = next((c for c in property_node.children if c.type == "modifiers"), None)
+    if modifiers is None:
+        return None
+    if not any(
+        _read_text(m, source) == "const"
+        for m in modifiers.children
+        if m.type == "property_modifier"
+    ):
+        return None
+    decl = next(
+        (c for c in property_node.children if c.type == "variable_declaration"), None
+    )
+    if decl is None:
+        return None
+    name_node = next(
+        (c for c in decl.children if c.type in ("simple_identifier", "identifier")), None
+    )
+    if name_node is None:
+        return None
+    name = _read_text(name_node, source)
+    if not name:
+        return None
+    initializer = None
+    seen_equals = False
+    for child in property_node.children:
+        if child.type == "=":
+            seen_equals = True
+            continue
+        if seen_equals and child.is_named:
+            initializer = child
+            break
+    if initializer is None:
+        return None
+    value, kind = _annotation_value_text(initializer, source)
+    if kind not in ("string", "number", "boolean"):
+        return None
+    return (name, value)
+
+
+def _annotations_metadata(declaration_node, source: bytes, ts_module: str) -> dict | None:
+    """Return `{"annotations": [...]}` for the languages that collect them."""
+    if ts_module == "tree_sitter_java":
+        annotations = _java_annotations(declaration_node, source)
+    elif ts_module == "tree_sitter_kotlin":
+        annotations = _kotlin_annotations(declaration_node, source)
+    else:
+        return None
+    return {"annotations": annotations} if annotations else None
 
 def _php_name_text(node, source: bytes) -> str | None:
     """Return the unqualified name text from a PHP `name`/`qualified_name` node."""
@@ -742,6 +990,542 @@ def _kotlin_function_return_type_node(func_node):
             if c.is_named:
                 return c
     return None
+
+
+def _kotlin_function_receiver_type_node(func_node):
+    """Return the declared receiver type of a Kotlin extension function."""
+    name_node = func_node.child_by_field_name("name")
+    for child in func_node.children:
+        if child is name_node or child.type in ("identifier", "simple_identifier"):
+            break
+        if child.type in ("user_type", "nullable_type", "type_reference"):
+            return child
+    return None
+
+
+def _kotlin_type_parameters_in_scope(node, source: bytes) -> set[str]:
+    """Return Kotlin generic parameter names visible at ``node``."""
+    names: set[str] = set()
+    current = node
+    while current is not None:
+        if current.type in ("class_declaration", "object_declaration", "function_declaration"):
+            for child in current.children:
+                if child.type != "type_parameters":
+                    continue
+                for parameter in child.children:
+                    if parameter.type != "type_parameter":
+                        continue
+                    name = next(
+                        (
+                            _read_text(token, source)
+                            for token in parameter.children
+                            if token.type in ("identifier", "simple_identifier")
+                        ),
+                        None,
+                    )
+                    if name:
+                        names.add(name)
+        current = current.parent
+    return names
+
+
+def _kotlin_receiver_type_name(type_node, source: bytes) -> str | None:
+    """Return the concrete Kotlin type usable for receiver resolution."""
+    if type_node is None:
+        return None
+    if type_node.type in ("nullable_type", "parenthesized_type", "type_reference"):
+        for child in type_node.children:
+            if child.is_named:
+                result = _kotlin_receiver_type_name(child, source)
+                if result:
+                    return result
+        return None
+    if type_node.type not in ("user_type", "simple_user_type"):
+        return None
+
+    identifiers: list[str] = []
+    for child in type_node.children:
+        if child.type in ("identifier", "type_identifier", "simple_identifier"):
+            identifiers.append(_read_text(child, source))
+        elif child.type == "simple_user_type":
+            nested = _kotlin_receiver_type_name(child, source)
+            if nested:
+                identifiers.append(nested)
+    name = ".".join(identifiers) if identifiers else None
+    bare_name = identifiers[-1] if identifiers else None
+    if (
+        not name
+        or bare_name in _KOTLIN_BUILTIN_TYPES
+        or bare_name in _JAVA_BUILTIN_TYPES
+        or (
+            len(identifiers) == 1
+            and bare_name in _kotlin_type_parameters_in_scope(type_node, source)
+        )
+    ):
+        return None
+    return name
+
+
+def _kotlin_file_resolution_scope(root_node, source: bytes) -> dict:
+    """Return package/import facts needed by corpus-level Kotlin resolution."""
+    package_name = ""
+    imports: list[dict[str, str | bool | None]] = []
+    property_names: list[str] = []
+
+    for child in root_node.children:
+        if child.type == "property_declaration":
+            property_name = _kotlin_declaration_name(child, source)
+            if property_name:
+                property_names.append(property_name)
+            continue
+        if child.type == "package_header":
+            package_node = child.child_by_field_name("path") or next(
+                (
+                    part
+                    for part in child.children
+                    if part.is_named
+                    and part.type
+                    in ("qualified_identifier", "identifier", "simple_identifier")
+                ),
+                None,
+            )
+            if package_node is not None:
+                package_name = _read_text(package_node, source)
+            continue
+        if child.type not in ("import", "import_header"):
+            continue
+
+        path_node = child.child_by_field_name("path") or next(
+            (
+                part
+                for part in child.children
+                if part.is_named
+                and part.type
+                in ("qualified_identifier", "identifier", "simple_identifier")
+            ),
+            None,
+        )
+        if path_node is None:
+            continue
+        path = _read_text(path_node, source)
+        if not path:
+            continue
+        is_star = any(part.type == "*" for part in child.children)
+        direct_identifiers = [
+            part
+            for part in child.children
+            if part.is_named
+            and part.type in ("identifier", "simple_identifier")
+            and part is not path_node
+        ]
+        alias = (
+            _read_text(direct_identifiers[-1], source)
+            if direct_identifiers
+            else None
+        )
+        imports.append({"path": path, "alias": alias, "star": is_star})
+
+    return {
+        "package": package_name,
+        "imports": imports,
+        "properties": property_names,
+    }
+
+
+def _kotlin_declaration_name(node, source: bytes) -> str | None:
+    """Return the name declared by a Kotlin property, parameter, or class parameter."""
+    for child in node.children:
+        if child.type in ("identifier", "simple_identifier"):
+            return _read_text(child, source) or None
+        if child.type == "variable_declaration":
+            for nested in child.children:
+                if nested.type in ("identifier", "simple_identifier"):
+                    return _read_text(nested, source) or None
+    return None
+
+
+def _kotlin_variable_names(node, source: bytes) -> list[str]:
+    """Return names introduced by a Kotlin variable or destructuring declaration."""
+    names: list[str] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if current.type in ("variable_declaration", "parameter", "class_parameter"):
+            name = _kotlin_declaration_name(current, source)
+            if name:
+                names.append(name)
+            continue
+        stack.extend(
+            child
+            for child in current.children
+            if child.type
+            in (
+                "variable_declaration",
+                "multi_variable_declaration",
+                "parameter",
+                "class_parameter",
+            )
+        )
+    return names
+
+
+def _kotlin_call_target_name(call_node, source: bytes) -> str | None:
+    """Return the bare function/constructor named by a simple Kotlin call."""
+    if call_node is None or call_node.type != "call_expression":
+        return None
+    first = next((child for child in call_node.children if child.is_named), None)
+    if first is None or first.type not in ("identifier", "simple_identifier"):
+        return None
+    return _read_text(first, source) or None
+
+
+def _kotlin_binding_type(
+    property_node,
+    source: bytes,
+    return_types: dict[str, str | None],
+    shadowed_call_targets: set[str] | frozenset[str] = frozenset(),
+    allow_implicit_call_inference: bool = True,
+) -> tuple[str | None, bool]:
+    """Infer a Kotlin binding type and whether it came from a constructor guess."""
+    explicit = _kotlin_receiver_type_name(
+        _kotlin_property_type_node(property_node), source
+    )
+    if explicit:
+        return explicit, False
+    if not allow_implicit_call_inference:
+        return None, False
+    initializer = next(
+        (child for child in property_node.children if child.type == "call_expression"),
+        None,
+    )
+    target = _kotlin_call_target_name(initializer, source)
+    if not target or target in shadowed_call_targets:
+        return None, False
+    declared_return = return_types.get(target)
+    if target[:1].isupper():
+        # Kotlin permits a function and a class constructor to share an
+        # uppercase name. Without argument signatures, choosing either one can
+        # fabricate a receiver type; retain only unambiguous constructor names.
+        return (None, False) if target in return_types else (target, True)
+    return declared_return, False
+
+
+def _kotlin_method_call_target_shadows(method_node, source: bytes) -> set[str]:
+    """Collect lexical bindings that can shadow getter or constructor calls."""
+    shadows: set[str] = set()
+
+    params = next(
+        (
+            child
+            for child in method_node.children
+            if child.type == "function_value_parameters"
+        ),
+        None,
+    )
+    if params is not None:
+        for parameter in params.children:
+            if parameter.type == "parameter":
+                name = _kotlin_declaration_name(parameter, source)
+                if name:
+                    shadows.add(name)
+
+    def visit(node) -> None:
+        if node.type in ("lambda_literal", "anonymous_function"):
+            return
+        if node.type in ("function_declaration", "class_declaration", "object_declaration"):
+            name = _kotlin_declaration_name(node, source)
+            if name:
+                shadows.add(name)
+            return
+        if node.type in (
+            "property_declaration",
+            "for_statement",
+            "catch_block",
+            "when_subject",
+        ):
+            shadows.update(_kotlin_variable_names(node, source))
+        for child in node.children:
+            visit(child)
+
+    body = next(
+        (child for child in method_node.children if child.type == "function_body"),
+        None,
+    )
+    if body is not None:
+        visit(body)
+    return shadows
+
+
+def _kotlin_owner_call_target_shadows(owner_node, source: bytes) -> set[str]:
+    """Collect callable-valued names visible from functions owned by a file/class."""
+    shadows: set[str] = set()
+
+    def add_declaration(node) -> None:
+        name = _kotlin_declaration_name(node, source)
+        if name:
+            shadows.add(name)
+
+    if owner_node.type == "source_file":
+        for child in owner_node.children:
+            if child.type == "property_declaration":
+                add_declaration(child)
+        return shadows
+
+    for child in owner_node.children:
+        if child.type == "primary_constructor":
+            stack = list(child.children)
+            while stack:
+                parameter = stack.pop()
+                if parameter.type == "class_parameter":
+                    if any(
+                        token.type in ("val", "var")
+                        for token in parameter.children
+                    ):
+                        add_declaration(parameter)
+                    continue
+                stack.extend(parameter.children)
+        elif child.type == "class_body":
+            for member in child.children:
+                if member.type == "property_declaration":
+                    add_declaration(member)
+                elif member.type == "companion_object":
+                    companion_body = next(
+                        (
+                            nested
+                            for nested in member.children
+                            if nested.type == "class_body"
+                        ),
+                        None,
+                    )
+                    if companion_body is not None:
+                        for companion_member in companion_body.children:
+                            if companion_member.type in (
+                                "function_declaration",
+                                "property_declaration",
+                            ):
+                                add_declaration(companion_member)
+    return shadows
+
+
+def _kotlin_owner_allows_implicit_call_inference(owner_node) -> bool:
+    """Whether unqualified calls have no unresolved inherited/outer receiver."""
+    if owner_node.type == "source_file":
+        return True
+    if any(child.type == "delegation_specifiers" for child in owner_node.children):
+        return False
+    current = owner_node.parent
+    while current is not None:
+        if current.type in ("class_declaration", "object_declaration"):
+            return False
+        current = current.parent
+    return True
+
+
+def _kotlin_nested_scope_shadow_names(node, source: bytes) -> set[str]:
+    """Return receiver names introduced by one nested Kotlin lexical scope."""
+    names: set[str] = set()
+    if node.type == "block":
+        for child in node.children:
+            if child.type == "property_declaration":
+                names.update(_kotlin_variable_names(child, source))
+    elif node.type == "catch_block":
+        name = next(
+            (
+                _read_text(child, source)
+                for child in node.children
+                if child.type in ("identifier", "simple_identifier")
+            ),
+            None,
+        )
+        if name:
+            names.add(name)
+    elif node.type == "when_expression":
+        subject = next(
+            (child for child in node.children if child.type == "when_subject"),
+            None,
+        )
+        names.update(_kotlin_variable_names(subject, source))
+    elif node.type in ("for_statement", "when_subject"):
+        names.update(_kotlin_variable_names(node, source))
+    return names
+
+
+def _kotlin_class_receiver_types(
+    class_node,
+    source: bytes,
+    return_types: dict[str, str | None],
+    shadowed_call_targets: set[str],
+    allow_implicit_call_inference: bool,
+) -> tuple[dict[str, str], set[str]]:
+    """Build the current class's property receiver types conservatively."""
+    table: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    constructor_inferred: set[str] = set()
+
+    def bind(
+        name: str | None,
+        type_name: str | None,
+        from_constructor: bool = False,
+    ) -> None:
+        if not name or not type_name or name in ambiguous:
+            return
+        previous = table.get(name)
+        if previous is not None and previous != type_name:
+            table.pop(name, None)
+            constructor_inferred.discard(name)
+            ambiguous.add(name)
+        else:
+            table[name] = type_name
+            if from_constructor:
+                constructor_inferred.add(name)
+
+    for child in class_node.children:
+        if child.type == "primary_constructor":
+            stack = list(child.children)
+            while stack:
+                parameter = stack.pop()
+                if parameter.type == "class_parameter":
+                    is_property = any(
+                        token.type in ("val", "var") for token in parameter.children
+                    )
+                    if is_property:
+                        type_node = next(
+                            (
+                                token
+                                for token in parameter.children
+                                if token.type
+                                in ("user_type", "nullable_type", "type_reference")
+                            ),
+                            None,
+                        )
+                        bind(
+                            _kotlin_declaration_name(parameter, source),
+                            _kotlin_receiver_type_name(type_node, source),
+                        )
+                    continue
+                stack.extend(parameter.children)
+        elif child.type == "class_body":
+            for member in child.children:
+                if member.type == "property_declaration":
+                    type_name, from_constructor = _kotlin_binding_type(
+                        member,
+                        source,
+                        return_types,
+                        shadowed_call_targets,
+                        allow_implicit_call_inference,
+                    )
+                    bind(
+                        _kotlin_declaration_name(member, source),
+                        type_name,
+                        from_constructor,
+                    )
+
+    table.update({f"this.{name}": type_name for name, type_name in table.items()})
+    constructor_inferred.update(
+        f"this.{name}" for name in tuple(constructor_inferred)
+    )
+    return table, constructor_inferred
+
+
+def _kotlin_method_receiver_types(
+    method_node,
+    source: bytes,
+    field_types: dict[str, str],
+    field_constructor_receivers: set[str],
+    return_types: dict[str, str | None],
+    shadowed_call_targets: set[str],
+    allow_implicit_call_inference: bool,
+) -> tuple[dict[str, str], set[str]]:
+    """Build one Kotlin method's receiver table without leaking sibling scopes."""
+    receiver_type_node = _kotlin_function_receiver_type_node(method_node)
+    # An extension function has two implicit receivers. Unqualified properties
+    # prefer the extension receiver, so treating the dispatch class's fields as
+    # ordinary locals would bind them to the wrong owner.
+    table = {} if receiver_type_node is not None else dict(field_types)
+    constructor_inferred = (
+        set() if receiver_type_node is not None else set(field_constructor_receivers)
+    )
+    ambiguous: set[str] = set()
+    extension_type = _kotlin_receiver_type_name(
+        receiver_type_node, source
+    )
+    if extension_type:
+        table["this"] = extension_type
+
+    params = next(
+        (
+            child
+            for child in method_node.children
+            if child.type == "function_value_parameters"
+        ),
+        None,
+    )
+    if params is not None:
+        for parameter in params.children:
+            if parameter.type != "parameter":
+                continue
+            name = _kotlin_declaration_name(parameter, source)
+            type_node = next(
+                (
+                    child
+                    for child in parameter.children
+                    if child.type in ("user_type", "nullable_type", "type_reference")
+                ),
+                None,
+            )
+            type_name = _kotlin_receiver_type_name(type_node, source)
+            if name:
+                table.pop(name, None)
+                constructor_inferred.discard(name)
+                if type_name:
+                    table[name] = type_name
+                else:
+                    ambiguous.add(name)
+
+    def bind_local(
+        name: str | None,
+        type_name: str | None,
+        from_constructor: bool = False,
+    ) -> None:
+        if not name or name in ambiguous:
+            return
+        previous = table.get(name)
+        if not type_name or (previous is not None and previous != type_name):
+            table.pop(name, None)
+            constructor_inferred.discard(name)
+            ambiguous.add(name)
+        else:
+            table[name] = type_name
+            if from_constructor:
+                constructor_inferred.add(name)
+
+    body = next(
+        (child for child in method_node.children if child.type == "function_body"),
+        None,
+    )
+    if body is not None:
+        root_scope = next(
+            (child for child in body.children if child.type == "block"), body
+        )
+        for statement in root_scope.children:
+            if statement.type != "property_declaration":
+                continue
+            names = _kotlin_variable_names(statement, source)
+            if len(names) == 1:
+                type_name, from_constructor = _kotlin_binding_type(
+                    statement,
+                    source,
+                    return_types,
+                    shadowed_call_targets,
+                    allow_implicit_call_inference,
+                )
+                bind_local(names[0], type_name, from_constructor)
+            else:
+                for name in names:
+                    bind_local(name, None)
+    for name in ambiguous:
+        table.pop(name, None)
+    return table, constructor_inferred
 
 def _swift_declaration_keyword(node) -> str | None:
     """Return the leading kind token for a Swift class_declaration: class/struct/enum/extension/actor."""
@@ -2263,6 +3047,21 @@ def _extract_generic(
     # while parameters and locals belong only to their declaring method.
     java_field_types: dict[str, dict[str, str]] = {}
     java_method_scopes: dict[int, tuple[object, str]] = {}
+    # Kotlin receiver typing mirrors Java's method-scoped model. Class nodes are
+    # retained until every same-owner function return type is known, so a property
+    # or local initialized from a getter can be typed without depending on source order.
+    kotlin_class_scopes: dict[str, object] = {}
+    kotlin_method_scopes: dict[int, tuple[object, str]] = {}
+    kotlin_return_types: dict[str, dict[str, str]] = {}
+    kotlin_seen_returns: dict[str, set[str]] = {}
+    kotlin_extension_receiver_types: dict[str, str] = {}
+    kotlin_object_nids: set[str] = set()
+    kotlin_qualified_type_names: dict[str, str] = {}
+    kotlin_class_nids_by_range: dict[tuple[int, int], str] = {}
+    kotlin_companion_owner_types: dict[str, set[str]] = {}
+    kotlin_companion_operator_invoke_owners: set[str] = set()
+    kotlin_private_function_nids: set[str] = set()
+    kotlin_inner_owner_names: dict[str, str] = {}
 
     csharp_interface_names: set[str] = set()
     if config.ts_module == "tree_sitter_c_sharp":
@@ -2339,6 +3138,12 @@ def _extract_generic(
             })
         return nid
 
+    def _emit_attribute_edges(owner_nid: str, annotations: list[dict], line: int) -> None:
+        for anno in annotations:
+            target_nid = ensure_named_node(anno["name"], line)
+            if target_nid != owner_nid:
+                add_edge(owner_nid, target_nid, "references", line, context="attribute")
+
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
 
@@ -2397,7 +3202,12 @@ def _extract_generic(
             metadata = None
             if config.ts_module == "tree_sitter_c_sharp" and parent_class_nid:
                 metadata = {"is_nested_type": True}
+            anno_metadata = _annotations_metadata(node, source, config.ts_module)
+            if anno_metadata:
+                metadata = {**(metadata or {}), **anno_metadata}
             add_node(class_nid, class_name, line, metadata=metadata)
+            if config.ts_module == "tree_sitter_kotlin" and anno_metadata:
+                _emit_attribute_edges(class_nid, anno_metadata["annotations"], line)
             callable_def_nids.add(class_nid)  # a class is callable (constructor)
             callable_class_nids.add(class_nid)  # ...but only via its constructor (#2137)
             # A nested class/object/trait is contained by its ENCLOSING type, not
@@ -2413,6 +3223,27 @@ def _extract_generic(
                 add_edge(parent_class_nid, class_nid, "contains", line)
             else:
                 add_edge(file_nid, class_nid, "contains", line)
+            if config.ts_module == "tree_sitter_kotlin":
+                kotlin_class_scopes[class_nid] = node
+                kotlin_class_nids_by_range[(node.start_byte, node.end_byte)] = class_nid
+                parent_type_name = kotlin_qualified_type_names.get(parent_class_nid or "")
+                kotlin_qualified_type_names[class_nid] = (
+                    f"{parent_type_name}.{class_name}"
+                    if parent_type_name
+                    else class_name
+                )
+                if (
+                    parent_class_nid
+                    and parent_type_name
+                    and any(
+                        child.type == "modifiers"
+                        and "inner" in _read_text(child, source).split()
+                        for child in node.children
+                    )
+                ):
+                    kotlin_inner_owner_names[class_nid] = parent_type_name
+                if t == "object_declaration":
+                    kotlin_object_nids.add(class_nid)
 
             # TS/JS decorators on the class and its members (@Component, @Injectable,
             # @Input, @Inject, @Entity, …). Decorators live only in class subtrees.
@@ -3047,9 +3878,16 @@ def _extract_generic(
         if (config.ts_module == "tree_sitter_kotlin"
                 and t == "property_declaration"
                 and parent_class_nid):
+            line = node.start_point[0] + 1
+            const = _kotlin_const_property(node, source)
+            if const is not None:
+                const_name, const_value = const
+                const_nid = _make_id(parent_class_nid, const_name)
+                add_node(const_nid, const_name, line,
+                         metadata={"const_value": const_value})
+                add_edge(parent_class_nid, const_nid, "contains", line)
             type_node = _kotlin_property_type_node(node)
             if type_node is not None:
-                line = node.start_point[0] + 1
                 refs: list[tuple[str, str]] = []
                 _kotlin_collect_type_refs(type_node, source, False, refs)
                 for ref_name, role in refs:
@@ -3229,14 +4067,17 @@ def _extract_generic(
                 return
 
             line = node.start_point[0] + 1
+            func_metadata = _annotations_metadata(node, source, config.ts_module)
             if parent_class_nid:
                 func_nid = _make_id(parent_class_nid, func_name)
-                add_node(func_nid, f".{func_name}()", line)
+                add_node(func_nid, f".{func_name}()", line, metadata=func_metadata)
                 add_edge(parent_class_nid, func_nid, "method", line)
             else:
                 func_nid = _make_id(stem, func_name)
-                add_node(func_nid, f"{func_name}()", line)
+                add_node(func_nid, f"{func_name}()", line, metadata=func_metadata)
                 add_edge(file_nid, func_nid, "contains", line)
+            if config.ts_module == "tree_sitter_kotlin" and func_metadata:
+                _emit_attribute_edges(func_nid, func_metadata["annotations"], line)
             callable_def_nids.add(func_nid)  # function / method def is callable
             if config.ts_module == "tree_sitter_python":
                 local_bound_names[func_nid] = _python_local_bound_names(node, source)
@@ -3390,6 +4231,58 @@ def _extract_generic(
                             add_edge(func_nid, target_nid, "references", line, context=ctx)
 
             if config.ts_module == "tree_sitter_kotlin":
+                owner_nid = parent_class_nid or file_nid
+                modifiers = {
+                    modifier
+                    for child in node.children
+                    if child.type == "modifiers"
+                    for modifier in _read_text(child, source).split()
+                }
+                is_operator = "operator" in modifiers
+                if "private" in modifiers:
+                    kotlin_private_function_nids.add(func_nid)
+                companion_owner = None
+                current = node.parent
+                inside_companion = False
+                while current is not None:
+                    if current.type == "companion_object":
+                        inside_companion = True
+                    elif current.type in ("class_declaration", "object_declaration"):
+                        if inside_companion:
+                            companion_owner = kotlin_class_nids_by_range.get(
+                                (current.start_byte, current.end_byte)
+                            )
+                            if companion_owner:
+                                kotlin_companion_owner_types.setdefault(
+                                    func_nid, set()
+                                ).add(companion_owner)
+                        break
+                    current = current.parent
+                extension_receiver_type = _kotlin_receiver_type_name(
+                    _kotlin_function_receiver_type_node(node), source
+                )
+                if extension_receiver_type:
+                    kotlin_extension_receiver_types[func_nid] = extension_receiver_type
+                if (
+                    companion_owner
+                    and func_name == "invoke"
+                    and is_operator
+                    and not extension_receiver_type
+                ):
+                    kotlin_companion_operator_invoke_owners.add(companion_owner)
+                return_type_node = _kotlin_function_return_type_node(node)
+                receiver_type = _kotlin_receiver_type_name(return_type_node, source)
+                returns = kotlin_return_types.setdefault(owner_nid, {})
+                seen_returns = kotlin_seen_returns.setdefault(owner_nid, set())
+                if func_name in seen_returns:
+                    previous = returns.get(func_name)
+                    if not receiver_type or not previous or previous != receiver_type:
+                        returns.pop(func_name, None)
+                else:
+                    seen_returns.add(func_name)
+                    if receiver_type:
+                        returns[func_name] = receiver_type
+
                 params_container = None
                 for c in node.children:
                     if c.type == "function_value_parameters":
@@ -3411,7 +4304,6 @@ def _extract_generic(
                             target_nid = ensure_named_node(ref_name, line)
                             if target_nid != func_nid:
                                 add_edge(func_nid, target_nid, "references", line, context=ctx)
-                return_type_node = _kotlin_function_return_type_node(node)
                 if return_type_node is not None:
                     refs = []
                     _kotlin_collect_type_refs(return_type_node, source, False, refs)
@@ -3583,6 +4475,11 @@ def _extract_generic(
             if body:
                 if config.ts_module == "tree_sitter_java" and parent_class_nid:
                     java_method_scopes[id(body)] = (node, parent_class_nid)
+                elif config.ts_module == "tree_sitter_kotlin":
+                    kotlin_method_scopes[id(body)] = (
+                        node,
+                        parent_class_nid or file_nid,
+                    )
                 function_bodies.append((func_nid, body))
             return
 
@@ -3727,7 +4624,87 @@ def _extract_generic(
         )
         for body_id, (method_node, class_nid) in java_method_scopes.items()
     }
+    kotlin_return_facts = {
+        owner_nid: {
+            name: kotlin_return_types.get(owner_nid, {}).get(name)
+            for name in names
+        }
+        for owner_nid, names in kotlin_seen_returns.items()
+    }
+    kotlin_field_types: dict[str, dict[str, str]] = {}
+    kotlin_field_constructor_receivers: dict[str, set[str]] = {}
+    kotlin_owner_call_target_shadows = {
+        file_nid: _kotlin_owner_call_target_shadows(root, source),
+        **{
+            class_nid: _kotlin_owner_call_target_shadows(class_node, source)
+            for class_nid, class_node in kotlin_class_scopes.items()
+        },
+    }
+    kotlin_owner_implicit_call_inference = {
+        file_nid: True,
+        **{
+            class_nid: _kotlin_owner_allows_implicit_call_inference(class_node)
+            for class_nid, class_node in kotlin_class_scopes.items()
+        },
+    }
+    for class_nid, class_node in kotlin_class_scopes.items():
+        field_types, constructor_receivers = _kotlin_class_receiver_types(
+            class_node,
+            source,
+            kotlin_return_facts.get(class_nid, {}),
+            kotlin_owner_call_target_shadows.get(class_nid, set()),
+            kotlin_owner_implicit_call_inference.get(class_nid, False),
+        )
+        kotlin_field_types[class_nid] = field_types
+        kotlin_field_constructor_receivers[class_nid] = constructor_receivers
 
+    kotlin_receiver_types: dict[int, dict[str, str]] = {}
+    kotlin_constructor_receivers: dict[int, set[str]] = {}
+    kotlin_call_target_shadows = {
+        body_id: (
+            kotlin_owner_call_target_shadows.get(owner_nid, set())
+            | _kotlin_method_call_target_shadows(method_node, source)
+        )
+        for body_id, (method_node, owner_nid) in kotlin_method_scopes.items()
+    }
+    kotlin_implicit_call_inference = {
+        body_id: (
+            kotlin_owner_implicit_call_inference.get(owner_nid, False)
+            and _kotlin_function_receiver_type_node(method_node) is None
+        )
+        for body_id, (method_node, owner_nid) in kotlin_method_scopes.items()
+    }
+    for body_id, (method_node, owner_nid) in kotlin_method_scopes.items():
+        receiver_types, constructor_receivers = _kotlin_method_receiver_types(
+            method_node,
+            source,
+            kotlin_field_types.get(owner_nid, {}),
+            kotlin_field_constructor_receivers.get(owner_nid, set()),
+            kotlin_return_facts.get(owner_nid, {}),
+            kotlin_call_target_shadows.get(body_id, set()),
+            kotlin_implicit_call_inference.get(body_id, False),
+        )
+        kotlin_receiver_types[body_id] = receiver_types
+        kotlin_constructor_receivers[body_id] = constructor_receivers
+    kotlin_method_returns = {
+        body_id: kotlin_return_facts.get(owner_nid, {})
+        for body_id, (_method_node, owner_nid) in kotlin_method_scopes.items()
+    }
+    kotlin_extension_receivers = {
+        body_id: _kotlin_function_receiver_type_node(method_node) is not None
+        for body_id, (method_node, _owner_nid) in kotlin_method_scopes.items()
+    }
+    kotlin_root_scope_ids = {
+        body_id: id(
+            next(
+                (child for child in body_node.children if child.type == "block"),
+                body_node,
+            )
+        )
+        for _caller_nid, body_node in function_bodies
+        for body_id in (id(body_node),)
+        if body_id in kotlin_method_scopes
+    }
     def _emit_indirect_by_name(ident_name: str, loc_node, scope_nid: str,
                                context: str) -> None:
         """Resolve a name that is referenced AS A VALUE to a real callable def and emit
@@ -3878,6 +4855,15 @@ def _extract_generic(
         caller_nid: str,
         java_types: dict[str, str] | None = None,
         extra_locals: frozenset[str] = frozenset(),
+        kotlin_types: dict[str, str] | None = None,
+        kotlin_returns: dict[str, str | None] | None = None,
+        kotlin_nested_callable: bool = False,
+        kotlin_extension_receiver: bool = False,
+        kotlin_constructor_receiver_names: set[str] | None = None,
+        kotlin_shadowed_call_targets: set[str] | None = None,
+        kotlin_allow_implicit_call_inference: bool = True,
+        kotlin_root_scope_id: int | None = None,
+        kotlin_lexical_shadows: frozenset[str] = frozenset(),
     ) -> None:
         if node.type in config.function_boundary_types:
             # JS/TS: an inline/returned closure not separately tracked in
@@ -3901,7 +4887,21 @@ def _extract_generic(
                     # closures compound the same way on their own recursion.
                     closure_locals = extra_locals | _js_local_bound_names(node, source)
                     for child in node.children:
-                        walk_calls(child, caller_nid, java_types, closure_locals)
+                        walk_calls(
+                            child,
+                            caller_nid,
+                            java_types,
+                            closure_locals,
+                            kotlin_types,
+                            kotlin_returns,
+                            kotlin_nested_callable,
+                            kotlin_extension_receiver,
+                            kotlin_constructor_receiver_names,
+                            kotlin_shadowed_call_targets,
+                            kotlin_allow_implicit_call_inference,
+                            kotlin_root_scope_id,
+                            kotlin_lexical_shadows,
+                        )
             return
 
         if node.type in config.call_types:
@@ -3911,7 +4911,21 @@ def _extract_generic(
                                       edges, seen_dyn_import_pairs):
                     # Still recurse into children (import().then(...) may have calls)
                     for child in node.children:
-                        walk_calls(child, caller_nid, java_types, extra_locals)
+                        walk_calls(
+                            child,
+                            caller_nid,
+                            java_types,
+                            extra_locals,
+                            kotlin_types,
+                            kotlin_returns,
+                            kotlin_nested_callable,
+                            kotlin_extension_receiver,
+                            kotlin_constructor_receiver_names,
+                            kotlin_shadowed_call_targets,
+                            kotlin_allow_implicit_call_inference,
+                            kotlin_root_scope_id,
+                            kotlin_lexical_shadows,
+                        )
                     return
 
             callee_name: str | None = None
@@ -3919,6 +4933,11 @@ def _extract_generic(
             is_this_field_call: bool = False
             swift_receiver: str | None = None
             member_receiver: str | None = None
+            member_receiver_type: str | None = None
+            member_receiver_from_constructor = False
+            kotlin_super_call = False
+            kotlin_type_receiver_candidate = False
+            kotlin_ambiguous_receiver = False
 
             # Special handling per language
             if config.ts_module == "tree_sitter_swift":
@@ -3954,6 +4973,87 @@ def _extract_generic(
                             if child.type in ("simple_identifier", "identifier"):
                                 callee_name = _read_text(child, source)
                                 break
+                        if not kotlin_nested_callable:
+                            receiver = first.children[0] if first.children else None
+                            if receiver is not None and receiver.type in (
+                                "simple_identifier",
+                                "identifier",
+                            ):
+                                member_receiver = _read_text(receiver, source)
+                                kotlin_type_receiver_candidate = bool(
+                                    member_receiver[:1].isupper()
+                                    and member_receiver
+                                    not in (kotlin_shadowed_call_targets or set())
+                                )
+                            elif (
+                                receiver is not None
+                                and receiver.type == "this_expression"
+                                and _read_text(receiver, source) == "this"
+                            ):
+                                member_receiver = "this"
+                            elif (
+                                receiver is not None
+                                and receiver.type == "this_expression"
+                            ):
+                                kotlin_ambiguous_receiver = True
+                            elif (
+                                receiver is not None
+                                and receiver.type == "super_expression"
+                                and _read_text(receiver, source) == "super"
+                            ):
+                                member_receiver = "super"
+                                kotlin_super_call = True
+                            elif (
+                                receiver is not None
+                                and receiver.type == "navigation_expression"
+                            ):
+                                parts = [
+                                    child for child in receiver.children if child.is_named
+                                ]
+                                if (
+                                    len(parts) == 2
+                                    and parts[0].type == "this_expression"
+                                    and _read_text(parts[0], source) == "this"
+                                    and parts[1].type
+                                    in ("simple_identifier", "identifier")
+                                ):
+                                    member_receiver = (
+                                        f"this.{_read_text(parts[1], source)}"
+                                    )
+                            elif receiver is not None and receiver.type == "call_expression":
+                                kotlin_ambiguous_receiver = True
+                                target = _kotlin_call_target_name(receiver, source)
+                                if (
+                                    kotlin_allow_implicit_call_inference
+                                    and target
+                                    and target not in (
+                                    kotlin_shadowed_call_targets or set()
+                                    )
+                                ):
+                                    return_facts = kotlin_returns or {}
+                                    declared_return = return_facts.get(target)
+                                    if target[:1].isupper():
+                                        member_receiver_type = (
+                                            None if target in return_facts else target
+                                        )
+                                        member_receiver_from_constructor = (
+                                            member_receiver_type is not None
+                                        )
+                                    else:
+                                        member_receiver_type = declared_return
+                            if member_receiver and member_receiver_type is None:
+                                if not (
+                                    kotlin_extension_receiver
+                                    and member_receiver.startswith("this.")
+                                ) and member_receiver not in kotlin_lexical_shadows:
+                                    member_receiver_type = (kotlin_types or {}).get(
+                                        member_receiver
+                                    )
+                                    member_receiver_from_constructor = (
+                                        member_receiver_type is not None
+                                        and member_receiver
+                                        in (kotlin_constructor_receiver_names or set())
+                                    )
             elif config.ts_module == "tree_sitter_scala":
                 # Scala: first child
                 first = node.children[0] if node.children else None
@@ -4174,7 +5274,20 @@ def _extract_generic(
                 _java_defer = (
                     config.ts_module == "tree_sitter_java" and is_member_call
                 )
-                if _java_defer or (
+                _kotlin_defer = (
+                    config.ts_module == "tree_sitter_kotlin"
+                    and is_member_call
+                    and (
+                        member_receiver_type is not None
+                        or kotlin_nested_callable
+                        or kotlin_ambiguous_receiver
+                        or kotlin_type_receiver_candidate
+                        or kotlin_super_call
+                        or member_receiver
+                        in (kotlin_shadowed_call_targets or set())
+                    )
+                )
+                if _java_defer or _kotlin_defer or (
                     is_member_call
                     and member_receiver
                     and (
@@ -4233,6 +5346,18 @@ def _extract_generic(
                         receiver_type = (java_types or {}).get(member_receiver or "")
                         if receiver_type:
                             rc_entry["receiver_type"] = receiver_type
+                    if config.ts_module == "tree_sitter_kotlin":
+                        rc_entry["lang"] = "kotlin"
+                        if kotlin_extension_receiver:
+                            rc_entry["kotlin_extension_receiver"] = True
+                        if member_receiver_type:
+                            rc_entry["receiver_type"] = member_receiver_type
+                        if member_receiver_from_constructor:
+                            rc_entry["kotlin_constructor_candidate"] = True
+                        if kotlin_type_receiver_candidate:
+                            rc_entry["kotlin_type_receiver_candidate"] = True
+                        if kotlin_super_call:
+                            rc_entry["kotlin_super_receiver"] = True
                     raw_calls.append(rc_entry)
 
             # Indirect dispatch: a function passed BY NAME as a call argument
@@ -4439,7 +5564,34 @@ def _extract_generic(
                 _emit_indirect_ref(ident, caller_nid, enclosing_locals, "return")
 
         for child in node.children:
-            walk_calls(child, caller_nid, java_types, extra_locals)
+            nested_callable = kotlin_nested_callable or (
+                config.ts_module == "tree_sitter_kotlin"
+                and child.type in ("lambda_literal", "anonymous_function")
+            )
+            lexical_shadows = kotlin_lexical_shadows
+            if (
+                config.ts_module == "tree_sitter_kotlin"
+                and id(child) != kotlin_root_scope_id
+            ):
+                lexical_shadows = frozenset(
+                    set(lexical_shadows)
+                    | _kotlin_nested_scope_shadow_names(child, source)
+                )
+            walk_calls(
+                child,
+                caller_nid,
+                java_types,
+                extra_locals,
+                kotlin_types,
+                kotlin_returns,
+                nested_callable,
+                kotlin_extension_receiver,
+                kotlin_constructor_receiver_names,
+                kotlin_shadowed_call_targets,
+                kotlin_allow_implicit_call_inference,
+                kotlin_root_scope_id,
+                lexical_shadows,
+            )
 
     if config.ts_module == "tree_sitter_ruby":
         for caller_nid, body_node in function_bodies:
@@ -4473,6 +5625,14 @@ def _extract_generic(
             body_node,
             caller_nid,
             java_receiver_types.get(id(body_node)),
+            kotlin_types=kotlin_receiver_types.get(id(body_node)),
+            kotlin_returns=kotlin_method_returns.get(id(body_node)),
+            kotlin_nested_callable=False,
+            kotlin_extension_receiver=kotlin_extension_receivers.get(id(body_node), False),
+            kotlin_constructor_receiver_names=kotlin_constructor_receivers.get(id(body_node)),
+            kotlin_shadowed_call_targets=kotlin_call_target_shadows.get(id(body_node)),
+            kotlin_allow_implicit_call_inference=kotlin_implicit_call_inference.get(id(body_node), True),
+            kotlin_root_scope_id=kotlin_root_scope_ids.get(id(body_node)),
         )
 
     # #1356: walk property/field initializers (collected above). walk_calls
@@ -4584,8 +5744,42 @@ def _extract_generic(
                     # Class def: callable only via constructor. The indirect_call
                     # guard excludes these to avoid false edges (#2137).
                     n["_callable_class"] = True
+    if kotlin_extension_receiver_types:
+        for n in nodes:
+            receiver_type = kotlin_extension_receiver_types.get(n["id"])
+            if receiver_type:
+                n["_kotlin_extension_receiver_type"] = receiver_type
+    if kotlin_object_nids:
+        for n in nodes:
+            if n["id"] in kotlin_object_nids:
+                n["_kotlin_object_definition"] = True
+    if kotlin_qualified_type_names:
+        for n in nodes:
+            qualified_name = kotlin_qualified_type_names.get(n["id"])
+            if qualified_name:
+                n["_kotlin_qualified_type_name"] = qualified_name
+    if kotlin_companion_owner_types:
+        for n in nodes:
+            companion_owners = kotlin_companion_owner_types.get(n["id"], set())
+            if len(companion_owners) == 1:
+                n["_kotlin_companion_owner"] = next(iter(companion_owners))
+    if kotlin_companion_operator_invoke_owners:
+        for n in nodes:
+            if n["id"] in kotlin_companion_operator_invoke_owners:
+                n["_kotlin_companion_operator_invoke"] = True
+    if kotlin_private_function_nids:
+        for n in nodes:
+            if n["id"] in kotlin_private_function_nids:
+                n["_kotlin_private_function"] = True
+    if kotlin_inner_owner_names:
+        for n in nodes:
+            inner_owner = kotlin_inner_owner_names.get(n["id"])
+            if inner_owner:
+                n["_kotlin_inner_owner_name"] = inner_owner
     if swift_extensions:
         result["swift_extensions"] = swift_extensions
+    if config.ts_module == "tree_sitter_kotlin":
+        result["kotlin_scope"] = _kotlin_file_resolution_scope(root, source)
     # TS/JS: augment the constructor-injection type table with local `new`
     # bindings and type-annotated parameters, so `const s = new Svc(); s.m()` and
     # a call on a typed param (incl. inside a closure) resolve (#1630). The
